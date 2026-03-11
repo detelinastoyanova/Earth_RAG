@@ -1,0 +1,137 @@
+# app.py
+import os
+import streamlit as st
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+
+INDEX_DIR = "storage/faiss_index"
+
+SYSTEM_PROMPT = """You are answering question about planet Earth. Answer only using the provided context and nothing else.
+If they ask a different question or you are uncertain just say "I don't know"
+"""
+
+# Updated: include conversation history with MessagesPlaceholder
+ANSWER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_PROMPT),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "Question: {question}\n\nContext:\n{context}\n\nReturn a clear answer.")
+])
+
+@st.cache_resource(show_spinner=False)
+def load_vectorstore():
+    embeddings = OpenAIEmbeddings()
+    return FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
+
+def format_context(docs):
+    lines = []
+    for i, d in enumerate(docs, 1):
+        src = d.metadata.get("source", "unknown")
+        page = d.metadata.get("page", None)
+        tag = f"{src} p.{page+1}" if isinstance(page, int) else src
+        snippet = d.page_content.strip().replace("\n", " ")
+        lines.append(f"[{i}] ({tag}) {snippet[:800]}")
+    return "\n\n".join(lines)
+
+def format_citation(meta):
+    src = meta.get("source", "unknown")
+    page = meta.get("page", None)
+    return f"{src} p.{page+1}" if isinstance(page, int) else src
+
+def main():
+    st.set_page_config(page_title="Earth Facts", page_icon="🌍")
+    st.markdown('<p style="font-size:30px; color:#646464;">🌍 New Earth Facts</p>', unsafe_allow_html=True)
+
+    if "OPENAI_API_KEY" not in st.secrets and not os.getenv("OPENAI_API_KEY"):
+        st.warning("Please set OPENAI_API_KEY in Streamlit Secrets.")
+        st.stop()
+
+    vs = load_vectorstore()
+    retriever_k = 5
+    threshold = 0.5
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+    # if "history" not in st.session_state:
+    #     st.session_state.history = []
+    #     if "history" not in st.session_state:
+    #         # Add greeting + fun fact when session starts
+    #         # Ask the LLM for a fun fact
+    #         fact_prompt = "Give me an interesting piece of information from the Tableau resources. Start with 'Did you know' and keep it short"
+    #         fun_fact = llm.invoke(fact_prompt).content
+    #
+    #         with st.chat_message("assistant"):
+    #             st.markdown(
+    #                  f"Hi! I'm here to help you with BSAN 720.\n\n"
+    #                 # f"Ask me anything about Tableau, the course, or the certificate exam.\n\n"
+    #                  f"💡 **Tableau fact:** {fun_fact}"
+    #             )
+
+    # Make sure history exists
+    if "history" not in st.session_state:
+        st.session_state.history = []
+
+    # Show greeting + fun fact only once per session (keep separate from history)
+    # if "greeted" not in st.session_state:
+    #     fact_prompt = "Ask me about Earth"
+    #     fun_fact = llm.invoke(fact_prompt).content
+    #     with st.chat_message("assistant"):#, avatar="icons/Maya_icon.png"):
+    #         st.markdown(
+    #             f"Hi! I'm Maya. I'm here to help you with BSAN 720.\n\n"
+    #             f"💡 **Tableau fact:** {fun_fact}"
+    #         )
+    #     st.session_state.greeted = True  # flag so it doesn’t repeat
+
+    # Replay chat history in the UI
+    for role, msg in st.session_state.history:
+        if role == 'user':
+            with st.chat_message(role, avatar='🤓'):
+                st.markdown(msg)
+        else:
+            with st.chat_message(role):#, avatar='icons/Maya_icon.png'):
+                st.markdown(msg)
+
+    #user_q = st.chat_input("Ask about the course material, syllabus, Tableau, certificate exam ... ")
+    user_q = st.chat_input("...")
+    if not user_q:
+        st.info("Ask me about the Earth I know.")
+        return
+
+    with st.chat_message("user", avatar='🤓'):
+        st.markdown(user_q)
+    st.session_state.history.append(("user", user_q))
+
+    with st.spinner("Thinking…"):
+        # Retrieve documents
+        docs_scores = vs.similarity_search_with_score(user_q, k=retriever_k)
+        filtered = [(d, s) for d, s in docs_scores if s <= (1 - threshold)]
+        docs = [d for d, _ in (filtered or docs_scores)]
+
+        if not docs:
+            bot = "I don't know."
+        else:
+            context = format_context(docs)
+
+            # Build chat_history as LangChain messages
+            chat_history = []
+            for role, msg in st.session_state.history[:-1]:  # exclude current input
+                if role == "user":
+                    chat_history.append(HumanMessage(content=msg))
+                elif role == "assistant":
+                    chat_history.append(AIMessage(content=msg))
+
+            prompt = ANSWER_PROMPT.format_messages(
+                question=user_q,
+                context=context,
+                chat_history=chat_history
+            )
+            resp = llm.invoke(prompt)
+            bot = resp.content
+
+    with st.chat_message("assistant"):#, avatar="icons/Maya_icon.png"):
+        st.markdown(bot)
+    st.session_state.history.append(("assistant", bot))
+
+if __name__ == "__main__":
+    main()
